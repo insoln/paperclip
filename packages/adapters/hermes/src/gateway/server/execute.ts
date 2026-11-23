@@ -502,23 +502,23 @@ async function createRun(input: {
   init: RequestInit;
   redactText: TextRedactor;
 }): Promise<unknown> {
-  const preflightDeadline = Date.now() + CREATE_RETRY_MAX_BUDGET_MS;
-  const capability = await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, preflightDeadline);
-  const budgetMs = capability
-    ? Math.min(CREATE_RETRY_MAX_BUDGET_MS, Math.max(0, capability.retentionSeconds * 1000 - CREATE_RETRY_RETENTION_MARGIN_MS))
-    : CREATE_RETRY_MAX_BUDGET_MS;
-  const deadline = Date.now() + budgetMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + CREATE_RETRY_MAX_BUDGET_MS;
+  const capability = await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, deadline);
+  const budgetDeadline = capability
+    ? Math.min(deadline, startedAt + Math.max(0, capability.retentionSeconds * 1000 - CREATE_RETRY_RETENTION_MARGIN_MS))
+    : deadline;
   for (let attempt = 0; ; attempt += 1) {
-    const request = createDeadlineSignal(deadline);
+    const request = createDeadlineSignal(budgetDeadline);
     try {
       return await fetchJson(input.url, { ...input.init, signal: request.signal });
     } catch (err) {
       const reason = err instanceof Error ? requestConnectionFailures.get(err)?.reason : undefined;
       const delayMs = CREATE_RETRY_DELAYS_MS[attempt];
       if (!capability || !reason || !AMBIGUOUS_CREATE_FAILURES.has(reason) || delayMs === undefined ||
-        remainingMs(deadline) <= delayMs ||
-        !await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, deadline)) throw err;
-      await boundedLog(input.ctx, "stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, input.redactText)}\n`, deadline);
+        remainingMs(budgetDeadline) <= delayMs ||
+        !await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, budgetDeadline)) throw err;
+      await boundedLog(input.ctx, "stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, input.redactText)}\n`, budgetDeadline);
       await delay(delayMs, request.signal);
       if (request.signal.aborted) throw err;
     } finally {

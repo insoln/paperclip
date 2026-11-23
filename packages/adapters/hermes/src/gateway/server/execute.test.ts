@@ -913,6 +913,41 @@ describe("execute", () => {
     expect(result.resultJson).toMatchObject({ run_id: "run-original", status: "completed" });
   });
 
+  it("uses one deadline for capability probing and the create request", async () => {
+    vi.useFakeTimers();
+    try {
+      let createSignal: AbortSignal | undefined;
+      const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/capabilities")) {
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(new Response(JSON.stringify({ features: { runs_idempotency: {
+              supported: true, durable: true, retention_seconds: 60,
+            } } }))), 44_000);
+          });
+        }
+        if (url.endsWith("/v1/runs")) {
+          createSignal = init?.signal ?? undefined;
+          return new Promise<Response>((_resolve, reject) => {
+            createSignal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+          });
+        }
+        return Promise.resolve(new Response(JSON.stringify({ status: "running" }), { status: 200 }));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const resultPromise = execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
+      await vi.advanceTimersByTimeAsync(44_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await resultPromise;
+
+      expect(createSignal?.aborted).toBe(true);
+      expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["unsupported", { features: { runs_idempotency: { supported: false, durable: true, retention_seconds: 86_400 } } }],
     ["unavailable", null],
