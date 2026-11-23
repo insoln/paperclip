@@ -793,7 +793,7 @@ describe("execute", () => {
       if (url.endsWith("/stop")) {
         return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
       }
-      if (init?.method === "GET") throw new TypeError("fetch failed");
+      if (init?.method === "GET") return new Response(JSON.stringify({ error: "invalid run" }), { status: 400 });
       return new Response(JSON.stringify({ status: "running" }), { status: 200 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -809,11 +809,85 @@ describe("execute", () => {
     expect(result.resultJson).not.toHaveProperty("executionCancellation");
   });
 
-  it("retries a create lost to a connection reset with the same Idempotency-Key and body", async () => {
+  it("retries a transient final status failure before acknowledging Stop", async () => {
+    const controller = new AbortController();
+    let statusReads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-retry-stop", status: "started" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        controller.abort(new Error("operator stop"));
+        return new Promise<Response>(() => {});
+      }
+      if (url.endsWith("/stop")) return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
+      if (init?.method === "GET" && url.endsWith("/run-retry-stop")) {
+        statusReads += 1;
+        if (statusReads === 1) {
+          throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+        }
+        return new Response(JSON.stringify({ status: "cancelled" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onCancellationReady = vi.fn(async () => undefined);
+
+    const result = await execute({
+      ...makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 }),
+      signal: controller.signal,
+      onCancellationReady,
+    });
+
+    expect(statusReads).toBe(2);
+    expect(onCancellationReady).toHaveBeenCalledOnce();
+    expect(result.executionRecovery).toMatchObject({ providerStopped: true });
+  });
+
+  it("aborts a stalled stop request at the cancellation deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      let stopSignal: AbortSignal | undefined;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-stalled-stop", status: "started" }), { status: 200 });
+        if (url.endsWith("/events")) {
+          controller.abort(new Error("operator stop"));
+          return new Promise<Response>(() => {});
+        }
+        if (url.endsWith("/stop")) {
+          stopSignal = init?.signal ?? undefined;
+          return new Promise<Response>((_resolve, reject) => {
+            stopSignal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+          });
+        }
+        return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const resultPromise = execute({
+        ...makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 30 }),
+        signal: controller.signal,
+        onCancellationReady: vi.fn(async () => undefined),
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await resultPromise;
+      expect(stopSignal?.aborted).toBe(true);
+      expect(result.executionRecovery).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("retries an accepted create reset once with the same idempotency request after durable capability verification", async () => {
     let creates = 0;
     const createInits: RequestInit[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url.endsWith("/v1/capabilities")) {
+        return new Response(JSON.stringify({ features: { runs_idempotency: {
+          supported: true, durable: true, retention_seconds: 86_400,
+        } } }), { status: 200 });
+      }
       if (url.endsWith("/v1/runs")) {
         creates += 1;
         createInits.push(init ?? {});
@@ -839,6 +913,32 @@ describe("execute", () => {
     expect(result.resultJson).toMatchObject({ run_id: "run-original", status: "completed" });
   });
 
+  it.each([
+    ["unsupported", { features: { runs_idempotency: { supported: false, durable: true, retention_seconds: 86_400 } } }],
+    ["unavailable", null],
+    ["malformed", { features: { runs_idempotency: { supported: true, durable: true, retention_seconds: "forever" } } }],
+  ])("does not retry an ambiguous create when idempotency capability is %s", async (_name, capability) => {
+    let creates = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) {
+        if (capability === null) return new Response("unavailable", { status: 503 });
+        return new Response(JSON.stringify(capability), { status: 200 });
+      }
+      if (url.endsWith("/v1/runs")) {
+        creates += 1;
+        throw new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
+
+    expect(creates).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+  });
+
   it("does not retry a create the gateway refused outright", async () => {
     const fetchMock = vi.fn(async () => {
       throw new TypeError("fetch failed", { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
@@ -849,6 +949,42 @@ describe("execute", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+  });
+
+  it("replays an event whose asynchronous log application failed before advancing the SSE cursor", async () => {
+    const eventHeaders: Array<Record<string, string>> = [];
+    let rejected = false;
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", eventReconnectMs: 250, pollIntervalMs: 10_000,
+    });
+    ctx.onLog = vi.fn(async (_stream, line) => {
+      if (line === "Hello" && !rejected) {
+        rejected = true;
+        throw new Error("disk full");
+      }
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-replay", status: "started" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        eventHeaders.push({ ...(init?.headers as Record<string, string>) });
+        return eventHeaders.length === 1
+          ? new Response(sseStream("id: 0\nevent: message.delta\ndata: {\"event\":\"message.delta\",\"delta\":\"Hello\"}\n\n"), { status: 200 })
+          : new Response(sseStream(
+            "id: 0\nevent: message.delta\ndata: {\"event\":\"message.delta\",\"delta\":\"Hello\"}\n\n" +
+            "id: 1\nevent: run.completed\ndata: {\"event\":\"run.completed\"}\n\n",
+          ), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(ctx);
+
+    expect(rejected).toBe(true);
+    expect(eventHeaders).toHaveLength(2);
+    expect(eventHeaders[1]).not.toHaveProperty("Last-Event-ID");
+    expect(result.resultJson).toMatchObject({ output: "Hello" });
   });
 
   it("resumes a dropped event stream with Last-Event-ID and skips replayed events", async () => {

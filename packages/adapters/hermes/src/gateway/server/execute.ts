@@ -443,16 +443,50 @@ function fetchFailureMessage(err: unknown): string {
 
 const CREATE_RETRY_DELAYS_MS = [250, 1_000];
 const AMBIGUOUS_CREATE_FAILURES = new Set<GatewayRequestFailure["reason"]>(["connection_reset", "connection_timeout"]);
+const CREATE_RETRY_MIN_RETENTION_SECONDS = 60;
 
-async function createRun(ctx: AdapterExecutionContext, url: string, init: RequestInit, redactText: TextRedactor): Promise<unknown> {
+type RunsIdempotencyCapability = {
+  supported: true;
+  durable: true;
+  retentionSeconds: number;
+};
+
+function parseRunsIdempotencyCapability(value: unknown): RunsIdempotencyCapability | null {
+  const feature = asRecord(asRecord(value)?.features)?.runs_idempotency;
+  const record = asRecord(feature);
+  const retentionSeconds = record?.retention_seconds;
+  return record?.supported === true && record.durable === true &&
+    typeof retentionSeconds === "number" && Number.isFinite(retentionSeconds) &&
+    retentionSeconds >= CREATE_RETRY_MIN_RETENTION_SECONDS
+    ? { supported: true, durable: true, retentionSeconds }
+    : null;
+}
+
+async function canRetryAmbiguousCreate(url: string, init: RequestInit): Promise<boolean> {
+  try {
+    const capability = await fetchJson(url, { method: "GET", headers: init.headers });
+    return parseRunsIdempotencyCapability(capability) !== null;
+  } catch {
+    return false;
+  }
+}
+
+async function createRun(input: {
+  ctx: AdapterExecutionContext;
+  url: string;
+  capabilityUrl: string;
+  init: RequestInit;
+  redactText: TextRedactor;
+}): Promise<unknown> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await fetchJson(url, init);
+      return await fetchJson(input.url, input.init);
     } catch (err) {
       const reason = err instanceof Error ? requestConnectionFailures.get(err)?.reason : undefined;
       const delayMs = CREATE_RETRY_DELAYS_MS[attempt];
-      if (!reason || !AMBIGUOUS_CREATE_FAILURES.has(reason) || delayMs === undefined) throw err;
-      await ctx.onLog("stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, redactText)}\n`);
+      if (!reason || !AMBIGUOUS_CREATE_FAILURES.has(reason) || delayMs === undefined ||
+        !await canRetryAmbiguousCreate(input.capabilityUrl, input.init)) throw err;
+      await input.ctx.onLog("stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, input.redactText)}\n`);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
@@ -593,12 +627,8 @@ async function handleEvent(
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
   const seq = eventSeq(frame, record);
-  if (seq !== null) {
-    if (seq <= state.lastSeq) return;
-    state.lastSeq = seq;
-  }
+  if (seq !== null && seq <= state.lastSeq) return;
   const eventName = eventNameFromData(parsed, frame.event);
-  state.lastEventName = eventName;
   await ctx.onLog(
     "stdout",
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
@@ -607,8 +637,8 @@ async function handleEvent(
   const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
   if (eventName === "message.delta" && delta) {
     const sanitizedDelta = redactText(delta);
-    state.outputChunks.push(sanitizedDelta);
     await ctx.onLog("stdout", sanitizedDelta);
+    state.outputChunks.push(sanitizedDelta);
   }
 
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
@@ -621,6 +651,8 @@ async function handleEvent(
       output: extractOutput(parsed),
     });
   }
+  state.lastEventName = eventName;
+  if (seq !== null) state.lastSeq = seq;
 }
 
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -831,12 +863,14 @@ async function stopRun(input: {
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
+  signal?: AbortSignal;
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
   try {
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal: input.signal,
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
@@ -859,23 +893,37 @@ async function settleCancellation(input: {
   runId: string;
   redactText: TextRedactor;
 }): Promise<{ receipt: CancellationReceipt | null; finalStatus: Record<string, unknown> | null }> {
-  await stopRun(input);
-  const finalStatus = await fetchFinalStatus({
-    baseUrl: input.baseUrl, headers: input.headers, runId: input.runId, deadlineMs: CANCEL_SETTLE_MS,
-  });
-  const status = extractStatus(finalStatus);
-  if (!status || !TERMINAL_STATUSES.has(status)) {
-    await input.ctx.onLog("stderr", `[hermes-gateway] stop of run ${input.runId} not confirmed within ${CANCEL_SETTLE_MS / 1000}s; leaving it unsettled\n`);
-    return { receipt: null, finalStatus };
+  const controller = new AbortController();
+  const deadline = Date.now() + CANCEL_SETTLE_MS;
+  const deadlineTimer = setTimeout(() => controller.abort(), CANCEL_SETTLE_MS);
+  try {
+    await stopRun({ ...input, signal: controller.signal });
+    const finalStatus = await fetchFinalStatus({
+      ctx: input.ctx,
+      baseUrl: input.baseUrl,
+      headers: input.headers,
+      runId: input.runId,
+      deadline,
+      signal: controller.signal,
+      retryTransientFailures: true,
+      redactText: input.redactText,
+    });
+    const status = extractStatus(finalStatus);
+    if (!status || !TERMINAL_STATUSES.has(status)) {
+      await input.ctx.onLog("stderr", `[hermes-gateway] stop of run ${input.runId} not confirmed within ${CANCEL_SETTLE_MS / 1000}s; leaving it unsettled\n`);
+      return { receipt: null, finalStatus };
+    }
+    await input.ctx.onLog("stdout", `[hermes-gateway] run ${input.runId} confirmed ${status} after stop\n`);
+    return {
+      finalStatus,
+      receipt: {
+        executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
+        resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } },
+      },
+    };
+  } finally {
+    clearTimeout(deadlineTimer);
   }
-  await input.ctx.onLog("stdout", `[hermes-gateway] run ${input.runId} confirmed ${status} after stop\n`);
-  return {
-    finalStatus,
-    receipt: {
-      executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
-      resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } },
-    },
-  };
 }
 
 function cancelledResult(input: {
@@ -909,26 +957,38 @@ function cancelledResult(input: {
   };
 }
 
+function isTransientStatusReadFailure(err: unknown): boolean {
+  const code = err instanceof Error ? (err as HermesHttpError).code : null;
+  return code === "hermes_gateway_connect_failed" || code === "hermes_gateway_upstream_error" ||
+    code === "hermes_gateway_rate_limited";
+}
+
 async function fetchFinalStatus(input: {
+  ctx: AdapterExecutionContext;
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
-  deadlineMs: number;
+  deadline: number;
+  signal?: AbortSignal;
+  retryTransientFailures?: boolean;
+  redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
-  const deadline = Date.now() + input.deadlineMs;
-  while (Date.now() < deadline) {
+  while (!input.signal?.aborted && Date.now() < input.deadline) {
     try {
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        signal: input.signal,
       });
       const record = asRecord(status);
       const normalized = extractStatus(status);
       if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
-    } catch {
-      return null;
+    } catch (err) {
+      if (input.signal?.aborted) break;
+      if (!input.retryTransientFailures || !isTransientStatusReadFailure(err)) return null;
+      await input.ctx.onLog("stderr", `[hermes-gateway] final status read failed: ${redactErrorMessage(err, input.redactText)}\n`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await delay(Math.min(500, Math.max(0, input.deadline - Date.now())), input.signal ?? new AbortController().signal);
   }
   return null;
 }
@@ -1068,6 +1128,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   ]);
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
+  const capabilitiesUrl = apiUrl(baseUrl, "/v1/capabilities");
 
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
@@ -1099,11 +1160,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
     ctx.onDispatch?.();
-    const created = await createRun(ctx, createRunUrl, {
-      method: "POST",
-      headers: runHeaders,
-      body: JSON.stringify(body),
-    }, redactText);
+    const created = await createRun({
+      ctx,
+      url: createRunUrl,
+      capabilityUrl: capabilitiesUrl,
+      init: {
+        method: "POST",
+        headers: runHeaders,
+        body: JSON.stringify(body),
+      },
+      redactText,
+    });
     runId = extractRunId(created);
     if (!runId) {
       return {
@@ -1172,7 +1239,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const finalStatus = await fetchFinalStatus({
+      ctx,
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadline: Date.now() + STOP_GRACE_MS,
+      redactText,
+    });
     return {
       exitCode: 1,
       signal: null,
