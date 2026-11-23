@@ -637,8 +637,8 @@ describe("execute", () => {
       schemaVersion: 1, provider: "hermes_gateway", operation: "create_run", reason: "connection_refused",
     } });
     expect(ctx.onDispatch).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBeUndefined();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/v1/runs"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.find(([input]) => String(input).endsWith("/v1/runs"))?.[1]?.redirect).toBeUndefined();
   });
 
   it.each([
@@ -939,15 +939,80 @@ describe("execute", () => {
     expect(result.errorCode).toBe("hermes_gateway_connect_failed");
   });
 
+  it("probes durable idempotency before dispatch and replays an accepted reset exactly once", async () => {
+    const requestOrder: string[] = [];
+    const executions = new Map<string, string>();
+    let creates = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) {
+        requestOrder.push("capabilities");
+        return new Response(JSON.stringify({ features: { runs_idempotency: { supported: true, durable: true, retention_seconds: 60 } } }));
+      }
+      if (url.endsWith("/v1/runs")) {
+        requestOrder.push("create");
+        creates += 1;
+        const key = (init?.headers as Record<string, string>)["Idempotency-Key"];
+        const runId = executions.get(key) ?? `run-${executions.size + 1}`;
+        executions.set(key, runId);
+        if (creates === 1) throw new TypeError("response dropped", { cause: { code: "ECONNRESET" } });
+        return new Response(JSON.stringify({ run_id: runId, status: "running", replayed: true }), { status: 202 });
+      }
+      if (url.endsWith("/events")) return new Response(sseStream("id: 1\nevent: run.completed\ndata: {\"status\":\"completed\",\"output\":\"done\"}\n\n"));
+      return new Response(JSON.stringify({ status: "completed", output: "done" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
+
+    expect(requestOrder.slice(0, 3)).toEqual(["capabilities", "create", "capabilities"]);
+    expect(creates).toBe(2);
+    expect(executions.size).toBe(1);
+    expect(result.resultJson).toMatchObject({ run_id: "run-1", status: "completed" });
+  });
+
+  it("uses an at-least-once SSE log delivery contract after a partial persist failure", async () => {
+    const persisted: string[] = [];
+    let rejectOnce = true;
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", eventReconnectMs: 250, pollIntervalMs: 10_000 });
+    ctx.onLog = vi.fn(async (_stream, line) => {
+      if (line === "Hello") {
+        persisted.push(line);
+        if (rejectOnce) {
+          rejectOnce = false;
+          throw new Error("persisted then rejected");
+        }
+      }
+    });
+    let eventConnections = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/capabilities")) return new Response(JSON.stringify({ features: { runs_idempotency: { supported: true, durable: true, retention_seconds: 60 } } }));
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-sse", status: "started" }));
+      if (url.endsWith("/events")) {
+        eventConnections += 1;
+        return new Response(sseStream(eventConnections === 1
+          ? "id: 0\nevent: message.delta\ndata: {\"delta\":\"Hello\"}\n\n"
+          : "id: 0\nevent: message.delta\ndata: {\"delta\":\"Hello\"}\n\nid: 1\nevent: run.completed\ndata: {\"status\":\"completed\"}\n\n"));
+      }
+      return new Response(JSON.stringify({ status: "running" }));
+    }));
+
+    const result = await execute(ctx);
+
+    expect(persisted).toEqual(["Hello", "Hello"]);
+    expect(result.resultJson).toMatchObject({ output: "Hello" });
+  });
+
   it("does not retry a create the gateway refused outright", async () => {
-    const fetchMock = vi.fn(async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => {
       throw new TypeError("fetch failed", { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) });
     });
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/v1/runs"))).toHaveLength(1);
     expect(result.errorCode).toBe("hermes_gateway_connect_failed");
   });
 
@@ -1083,7 +1148,7 @@ describe("gateway connection failure reporting", () => {
     [503, "upstream_error", "remote_unavailable", "transient_upstream"],
     [599, "upstream_error", "remote_unavailable", "transient_upstream"],
   ])("classifies HTTP %i without changing retry or dispatch behavior", async (status, code, reason, errorFamily) => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ detail: "remote failure" }), {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => new Response(JSON.stringify({ detail: "remote failure" }), {
       status, headers: { "retry-after": "7" },
     }));
     vi.stubGlobal("fetch", fetchMock);
@@ -1097,7 +1162,7 @@ describe("gateway connection failure reporting", () => {
     expect(result.errorMessage).toContain(`Hermes gateway HTTP ${status}`);
     expect(result.executionRecovery).toBeUndefined();
     expect(ctx.onDispatch).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/v1/runs"))).toHaveLength(1);
     expect(Object.keys(result.resultJson ?? {})).toEqual(["connectionFailure"]);
   });
 

@@ -55,6 +55,7 @@ type TerminalState = {
 type ExecutionState = {
   runId: string;
   lastSeq: number;
+  appliedSeq: Set<number>;
   outputChunks: string[];
   lastEventName: string | null;
   terminal: TerminalState | null;
@@ -444,6 +445,8 @@ function fetchFailureMessage(err: unknown): string {
 const CREATE_RETRY_DELAYS_MS = [250, 1_000];
 const AMBIGUOUS_CREATE_FAILURES = new Set<GatewayRequestFailure["reason"]>(["connection_reset", "connection_timeout"]);
 const CREATE_RETRY_MIN_RETENTION_SECONDS = 60;
+const CREATE_RETRY_MAX_BUDGET_MS = 45_000;
+const CREATE_RETRY_RETENTION_MARGIN_MS = 10_000;
 
 type RunsIdempotencyCapability = {
   supported: true;
@@ -462,12 +465,33 @@ function parseRunsIdempotencyCapability(value: unknown): RunsIdempotencyCapabili
     : null;
 }
 
-async function canRetryAmbiguousCreate(url: string, init: RequestInit): Promise<boolean> {
+function remainingMs(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+function createDeadlineSignal(deadline: number): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remainingMs(deadline));
+  return { signal: controller.signal, dispose: () => clearTimeout(timer) };
+}
+
+async function boundedLog(ctx: AdapterExecutionContext, stream: "stdout" | "stderr", line: string, deadline: number): Promise<void> {
+  const remaining = remainingMs(deadline);
+  if (remaining <= 0) return;
+  await Promise.race([
+    Promise.resolve(ctx.onLog(stream, line)).catch(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, remaining)),
+  ]);
+}
+
+async function getRunsIdempotencyCapability(url: string, headers: HeadersInit, deadline: number): Promise<RunsIdempotencyCapability | null> {
+  const request = createDeadlineSignal(deadline);
   try {
-    const capability = await fetchJson(url, { method: "GET", headers: init.headers });
-    return parseRunsIdempotencyCapability(capability) !== null;
+    return parseRunsIdempotencyCapability(await fetchJson(url, { method: "GET", headers, signal: request.signal }));
   } catch {
-    return false;
+    return null;
+  } finally {
+    request.dispose();
   }
 }
 
@@ -478,16 +502,27 @@ async function createRun(input: {
   init: RequestInit;
   redactText: TextRedactor;
 }): Promise<unknown> {
+  const preflightDeadline = Date.now() + CREATE_RETRY_MAX_BUDGET_MS;
+  const capability = await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, preflightDeadline);
+  const budgetMs = capability
+    ? Math.min(CREATE_RETRY_MAX_BUDGET_MS, Math.max(0, capability.retentionSeconds * 1000 - CREATE_RETRY_RETENTION_MARGIN_MS))
+    : CREATE_RETRY_MAX_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
   for (let attempt = 0; ; attempt += 1) {
+    const request = createDeadlineSignal(deadline);
     try {
-      return await fetchJson(input.url, input.init);
+      return await fetchJson(input.url, { ...input.init, signal: request.signal });
     } catch (err) {
       const reason = err instanceof Error ? requestConnectionFailures.get(err)?.reason : undefined;
       const delayMs = CREATE_RETRY_DELAYS_MS[attempt];
-      if (!reason || !AMBIGUOUS_CREATE_FAILURES.has(reason) || delayMs === undefined ||
-        !await canRetryAmbiguousCreate(input.capabilityUrl, input.init)) throw err;
-      await input.ctx.onLog("stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, input.redactText)}\n`);
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (!capability || !reason || !AMBIGUOUS_CREATE_FAILURES.has(reason) || delayMs === undefined ||
+        remainingMs(deadline) <= delayMs ||
+        !await getRunsIdempotencyCapability(input.capabilityUrl, input.init.headers ?? {}, deadline)) throw err;
+      await boundedLog(input.ctx, "stderr", `[hermes-gateway] create request ${reason}; retrying with the same Idempotency-Key in ${delayMs}ms: ${redactErrorMessage(err, input.redactText)}\n`, deadline);
+      await delay(delayMs, request.signal);
+      if (request.signal.aborted) throw err;
+    } finally {
+      request.dispose();
     }
   }
 }
@@ -579,6 +614,7 @@ function createExecutionState(runId: string): ExecutionState {
   return {
     runId,
     lastSeq: -1,
+    appliedSeq: new Set(),
     outputChunks: [],
     lastEventName: null,
     terminal: null,
@@ -637,8 +673,12 @@ async function handleEvent(
   const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
   if (eventName === "message.delta" && delta) {
     const sanitizedDelta = redactText(delta);
+    const applied = seq !== null && state.appliedSeq.has(seq);
     await ctx.onLog("stdout", sanitizedDelta);
-    state.outputChunks.push(sanitizedDelta);
+    if (!applied) {
+      state.outputChunks.push(sanitizedDelta);
+      if (seq !== null) state.appliedSeq.add(seq);
+    }
   }
 
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
@@ -864,6 +904,7 @@ async function stopRun(input: {
   headers: Record<string, string>;
   runId: string;
   signal?: AbortSignal;
+  deadline?: number;
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
   try {
@@ -872,10 +913,10 @@ async function stopRun(input: {
       headers: input.headers,
       signal: input.signal,
     });
-    await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
+    await boundedLog(input.ctx, "stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`, input.deadline ?? Date.now());
     return asRecord(stopped);
   } catch (err) {
-    await input.ctx.onLog("stderr", `[hermes-gateway] stop request failed: ${redactErrorMessage(err, input.redactText)}\n`);
+    await boundedLog(input.ctx, "stderr", `[hermes-gateway] stop request failed: ${redactErrorMessage(err, input.redactText)}\n`, input.deadline ?? Date.now());
     return null;
   }
 }
@@ -897,7 +938,7 @@ async function settleCancellation(input: {
   const deadline = Date.now() + CANCEL_SETTLE_MS;
   const deadlineTimer = setTimeout(() => controller.abort(), CANCEL_SETTLE_MS);
   try {
-    await stopRun({ ...input, signal: controller.signal });
+    await stopRun({ ...input, signal: controller.signal, deadline });
     const finalStatus = await fetchFinalStatus({
       ctx: input.ctx,
       baseUrl: input.baseUrl,
@@ -910,10 +951,10 @@ async function settleCancellation(input: {
     });
     const status = extractStatus(finalStatus);
     if (!status || !TERMINAL_STATUSES.has(status)) {
-      await input.ctx.onLog("stderr", `[hermes-gateway] stop of run ${input.runId} not confirmed within ${CANCEL_SETTLE_MS / 1000}s; leaving it unsettled\n`);
+      await boundedLog(input.ctx, "stderr", `[hermes-gateway] stop of run ${input.runId} not confirmed within ${CANCEL_SETTLE_MS / 1000}s; leaving it unsettled\n`, deadline);
       return { receipt: null, finalStatus };
     }
-    await input.ctx.onLog("stdout", `[hermes-gateway] run ${input.runId} confirmed ${status} after stop\n`);
+    await boundedLog(input.ctx, "stdout", `[hermes-gateway] run ${input.runId} confirmed ${status} after stop\n`, deadline);
     return {
       finalStatus,
       receipt: {
@@ -986,7 +1027,7 @@ async function fetchFinalStatus(input: {
     } catch (err) {
       if (input.signal?.aborted) break;
       if (!input.retryTransientFailures || !isTransientStatusReadFailure(err)) return null;
-      await input.ctx.onLog("stderr", `[hermes-gateway] final status read failed: ${redactErrorMessage(err, input.redactText)}\n`);
+      await boundedLog(input.ctx, "stderr", `[hermes-gateway] final status read failed: ${redactErrorMessage(err, input.redactText)}\n`, input.deadline);
     }
     await delay(Math.min(500, Math.max(0, input.deadline - Date.now())), input.signal ?? new AbortController().signal);
   }
